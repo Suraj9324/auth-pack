@@ -1,0 +1,78 @@
+[project]
+name = "blockauth"
+version = "0.19.1"
+description = "Comprehensive Python authentication package bridging Web2 and Web3"
+authors = [{name = "BloclabsHQ", email = "eng@bloclabs.com"}]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.12"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Framework :: Django",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "django>=5.2.17,<7.0",
+    "pyjwt>=2.15.0,<3.0",
+    "requests>=2.33.1,<3.0",
+    "djangorestframework>=3.18.3,<4.0",
+    "django-ratelimit>=4.1,<5.0",
+    "drf-spectacular>=0.27,<1.0",
+    "web3>=7.6.0,<8.0",
+    "eth-account>=0.13.0,<1.0",
+    "cryptography>=50.0.0",
+    "argon2-cffi>=23.0.0",
+    "webauthn>=2.0.0",
+    "uuid6>=2024.7.10",
+]
+
+[project.urls]
+Homepage = "https://github.com/BloclabsHQ/auth-pack"
+Repository = "https://github.com/BloclabsHQ/auth-pack"
+
+[dependency-groups]
+dev = [
+    "black>=26.3.0",
+    "isort>=5.13.0",
+    "flake8>=7.0.0",
+    "autoflake>=2.3.0",
+    "pytest>=8.0.0",
+    "pytest-django>=4.8.0",
+    "mypy>=1.10.0",
+    "mkdocs-material>=9.7.6",
+]
+
+[tool.uv]
+package = true
+
+[tool.black]
+line-length = 120
+target-version = ["py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 120
+
+[tool.pytest.ini_options]
+testpaths = ["blockauth"]
+python_files = ["test_*.py", "tests.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_return_any = true
+warn_unused_configs = true
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

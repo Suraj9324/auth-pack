@@ -1,0 +1,145 @@
+from datetime import timedelta
+
+from django.conf import settings
+from django.core.signals import setting_changed
+from rest_framework.settings import APISettings
+
+from blockauth.constants import ConfigKeys
+
+USER_SETTINGS = getattr(settings, "BLOCK_AUTH_SETTINGS", dict())
+
+DEFAULTS = {
+    # Default access-token lifetime is 3600 seconds (1 hour).
+    # High-security deployments should use 15 minutes or less.
+    "ACCESS_TOKEN_LIFETIME": timedelta(seconds=3600),
+    "REFRESH_TOKEN_LIFETIME": timedelta(days=1),
+    # Allowed: HS256, HS384, HS512, RS256, RS384, RS512, ES256, ES384, ES512,
+    # PS256, PS384, PS512. Any other value is rejected when a token class is built.
+    "ALGORITHM": "HS256",
+    "AUTH_HEADER_NAME": "HTTP_AUTHORIZATION",
+    "USER_ID_FIELD": "id",
+    # Symmetric JWT signing key (JWT_SECRET_KEY when configured, otherwise
+    # SECRET_KEY) must be at least 32 characters. Startup checks that signing
+    # key and raises when DEBUG is False, and warns when DEBUG is True.
+    "SECRET_KEY": settings.SECRET_KEY,
+    # Asymmetric JWT (RS256/ES256): set these instead of JWT_SECRET_KEY
+    "JWT_PRIVATE_KEY": None,  # PEM-encoded private key for signing
+    "JWT_PUBLIC_KEY": None,  # PEM-encoded public key for verification
+    "OTP_VALIDITY": timedelta(minutes=1),
+    "OTP_LENGTH": 6,
+    "REQUEST_LIMIT": (
+        3,
+        30,
+    ),  # (number of request, duration in second) rate limits based on per (email, subject, and IP address)
+    # Number of trusted reverse proxies in front of the app. Controls how the
+    # client IP is read from X-Forwarded-For (counted from the right). Set to 0
+    # when the app is directly internet-facing, or to the trusted hop count.
+    "TRUSTED_PROXY_DEPTH": 1,
+    # Email verification settings
+    "EMAIL_VERIFICATION_REQUIRED": False,  # Whether users must verify email before accessing non-auth endpoints
+    # Feature flags - Enable/disable specific authentication features
+    ConfigKeys.FEATURES: {
+        # Core authentication features
+        "SIGNUP": True,  # Enable user registration
+        "BASIC_LOGIN": True,  # Enable email/password login
+        "PASSWORDLESS_LOGIN": True,  # Enable passwordless login with OTP
+        "WALLET_LOGIN": True,  # Enable wallet-based authentication
+        "TOKEN_REFRESH": True,  # Enable JWT token refresh
+        "TOKEN_LOGOUT": True,  # Revoke the current refresh family
+        # Password management
+        "PASSWORD_RESET": True,  # Enable password reset functionality
+        "PASSWORD_CHANGE": True,  # Enable password change for authenticated users
+        # Email management
+        "EMAIL_CHANGE": True,  # Enable email change functionality
+        "EMAIL_VERIFICATION": True,  # Enable email verification requirement
+        # Wallet features
+        "WALLET_EMAIL_ADD": True,  # Enable adding email to wallet accounts
+        "WALLET_LINK": True,  # Enable linking a MetaMask wallet to an existing account
+        # Social authentication (controlled by provider configuration)
+        "SOCIAL_AUTH": True,  # Master switch for social authentication
+        # Passkey/WebAuthn authentication
+        "PASSKEY_AUTH": True,  # Enable passkey/WebAuthn authentication (Face ID, Touch ID, Windows Hello)
+        # TOTP 2FA
+        "TOTP_2FA": False,  # Enable TOTP 2FA (requires TOTP_CONFIG.ENCRYPTION_KEY)
+    },
+    # Trigger classes
+    "POST_SIGNUP_TRIGGER": "blockauth.triggers.DummyPostSignupTrigger",
+    "PRE_SIGNUP_TRIGGER": "blockauth.triggers.DummyPreSignupTrigger",
+    "POST_LOGIN_TRIGGER": "blockauth.triggers.DummyPostLoginTrigger",
+    # Password management triggers
+    "POST_PASSWORD_CHANGE_TRIGGER": "blockauth.triggers.DummyPostPasswordChangeTrigger",
+    "POST_PASSWORD_RESET_TRIGGER": "blockauth.triggers.DummyPostPasswordResetTrigger",
+    "POST_WALLET_LINK_TRIGGER": "blockauth.triggers.DummyPostWalletLinkTrigger",
+    # other util classes
+    "DEFAULT_NOTIFICATION_CLASS": "blockauth.notification.DummyNotification",
+    "BLOCK_AUTH_LOGGER_CLASS": "blockauth.utils.logger.DummyLogger",
+    # Unused. Login and link nonce lifetime is the Django setting
+    # ``WALLET_LOGIN_NONCE_TTL_SECONDS``. Kept so existing settings dicts
+    # that still include ``WALLET_MESSAGE_TTL`` do not need a code change.
+    "WALLET_MESSAGE_TTL": 300,
+    # Refresh token rotation
+    "ROTATE_REFRESH_TOKENS": True,  # Blacklist old refresh token on rotation
+    # Apple Sign-In configuration
+    "APPLE_TEAM_ID": None,
+    "APPLE_KEY_ID": None,
+    "APPLE_PRIVATE_KEY_PEM": None,  # one of these two must be set when APPLE_LOGIN is enabled
+    "APPLE_PRIVATE_KEY_PATH": None,
+    "APPLE_SERVICES_ID": None,
+    "APPLE_BUNDLE_IDS": (),  # tuple of bundle IDs accepted in native id_token aud
+    "APPLE_REDIRECT_URI": None,
+    "APPLE_NOTIFICATION_TRIGGER": None,  # optional integrator hook for S2S notifications
+    "APPLE_CALLBACK_COOKIE_SAMESITE": "None",  # form_post requires SameSite=None+Secure on deployed TLS
+    "APPLE_NOTIFICATION_MAX_AGE_SECONDS": 300,  # reject stale S2S event_time values
+    "APPLE_NOTIFICATION_FUTURE_LEEWAY_SECONDS": 60,  # tolerate small Apple/server clock skew
+    "APPLE_WEB_CALLBACK_RATE_LIMIT": (30, 60),  # per-IP (requests, seconds)
+    "APPLE_NATIVE_VERIFY_RATE_LIMIT": (30, 60),  # per-IP (requests, seconds)
+    "APPLE_NOTIFICATION_RATE_LIMIT": (60, 60),  # per-IP (requests, seconds)
+    # Outbound OAuth/SocialIdentity provider calls
+    "SOCIAL_OUTBOUND_TIMEOUT": (3.05, 10),  # requests timeout tuple: (connect_seconds, read_seconds)
+    # Google native id_token verify
+    "GOOGLE_NATIVE_AUDIENCES": (),  # tuple of web client IDs accepted in id_token.aud
+    # Generic OIDC verifier
+    "OIDC_JWKS_CACHE_TTL_SECONDS": 3600,
+    "OIDC_VERIFIER_LEEWAY_SECONDS": 60,
+    # SocialIdentity refresh-token-at-rest (base64-encoded 32 bytes)
+    "SOCIAL_IDENTITY_ENCRYPTION_KEY": None,
+    # Step-up receipt for setting a first password. Unset means not configured.
+    "STEPUP_RECEIPT_SECRET": None,
+    "STEPUP_RECEIPT_AUDIENCE": "default",
+    "STEPUP_RECEIPT_SCOPE": "mpc",
+}
+
+
+# Update defaults with provider-specific settings
+for provider, settings_dict in USER_SETTINGS.get("AUTH_PROVIDERS", dict()).items():
+    for key, val in settings_dict.items():
+        DEFAULTS[f"{provider}_{key}"] = val
+
+for class_name, class_object in USER_SETTINGS.get("DEFAULT_TRIGGER_CLASSES", dict()).items():
+    DEFAULTS[f"{class_name}_TRIGGER"] = class_object
+
+for key, val in USER_SETTINGS.items():
+    DEFAULTS[key] = val
+
+IMPORT_STRINGS = (
+    "DEFAULT_NOTIFICATION_CLASS",
+    "POST_SIGNUP_TRIGGER",
+    "PRE_SIGNUP_TRIGGER",
+    "POST_LOGIN_TRIGGER",
+    "POST_PASSWORD_CHANGE_TRIGGER",
+    "POST_PASSWORD_RESET_TRIGGER",
+    "POST_WALLET_LINK_TRIGGER",
+    "BLOCK_AUTH_LOGGER_CLASS",
+    "APPLE_NOTIFICATION_TRIGGER",
+)
+
+auth_settings = APISettings(user_settings=None, defaults=DEFAULTS, import_strings=IMPORT_STRINGS)
+
+
+def reload_api_settings(**kwargs) -> None:
+    setting = kwargs.get("setting")
+    if setting == "BLOCK_AUTH_SETTINGS":
+        auth_settings.reload()
+
+
+setting_changed.connect(reload_api_settings)

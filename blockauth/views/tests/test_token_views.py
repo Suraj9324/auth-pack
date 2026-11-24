@@ -1,0 +1,286 @@
+"""
+Tests for AuthRefreshTokenView.
+"""
+
+import time
+from datetime import timedelta
+from unittest.mock import patch
+
+import pytest
+from django.urls import reverse
+from rest_framework import status
+
+from blockauth.utils.token import Token, generate_auth_token
+
+REFRESH_URL = reverse("refresh-token")
+
+
+@pytest.mark.django_db
+class TestAuthRefreshTokenView:
+
+    def test_refresh_returns_new_tokens(self, api_client, create_user):
+        user = create_user()
+        token = Token()
+        _, refresh = generate_auth_token(token_class=token, user_id=str(user.id))
+
+        response = api_client.post(REFRESH_URL, {"refresh_token": refresh})
+        assert response.status_code == status.HTTP_200_OK
+        assert "access" in response.data
+        assert "refresh" in response.data
+
+    def test_refresh_returns_user_payload(self, api_client, create_user):
+        """api-optimization v0.9.0: refresh response includes the user so
+        clients can drop the 5-min /me/ poller. The view already loads
+        the user for custom-claims population."""
+        user = create_user(email="ref@test.com")
+        token = Token()
+        _, refresh = generate_auth_token(token_class=token, user_id=str(user.id))
+
+        response = api_client.post(REFRESH_URL, {"refresh_token": refresh})
+        assert response.status_code == status.HTTP_200_OK
+        assert "user" in response.data
+        user_payload = response.data["user"]
+        assert user_payload["id"] == str(user.id)
+        assert user_payload["email"] == "ref@test.com"
+        assert user_payload["is_verified"] is True
+        assert "wallet_address" in user_payload
+        # Issue #131: clients require is_active, date_joined, and wallets in
+        # every login-shaped response. first_name / last_name are intentionally
+        # omitted when unset.
+        assert user_payload["is_active"] is True
+        assert "date_joined" in user_payload
+        assert user_payload["wallets"] == []
+        assert "first_name" not in user_payload
+        assert "last_name" not in user_payload
+
+    def test_refresh_with_access_token_fails(self, api_client, create_user):
+        """Access tokens should not be usable as refresh tokens."""
+        user = create_user()
+        token = Token()
+        access, _ = generate_auth_token(token_class=token, user_id=str(user.id))
+
+        response = api_client.post(REFRESH_URL, {"refresh_token": access})
+        # Should fail because token type is "access" not "refresh"
+        assert response.status_code in (
+            status.HTTP_400_BAD_REQUEST,
+            status.HTTP_401_UNAUTHORIZED,
+            status.HTTP_403_FORBIDDEN,
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )
+
+    def test_refresh_with_invalid_token(self, api_client):
+        response = api_client.post(REFRESH_URL, {"refresh_token": "invalid.jwt.token"})
+        assert response.status_code in (
+            status.HTTP_400_BAD_REQUEST,
+            status.HTTP_401_UNAUTHORIZED,
+            status.HTTP_403_FORBIDDEN,
+        )
+
+    def test_refresh_missing_token(self, api_client):
+        response = api_client.post(REFRESH_URL, {})
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+    def test_refresh_is_limited(self, api_client):
+        statuses = []
+        for _ in range(31):
+            response = api_client.post(REFRESH_URL, {})
+            statuses.append(response.status_code)
+        assert statuses[0] == status.HTTP_400_BAD_REQUEST
+        assert statuses[-1] == status.HTTP_429_TOO_MANY_REQUESTS
+
+    def test_refresh_limit_ignores_identifier(self, api_client):
+        last = None
+        for i in range(31):
+            response = api_client.post(
+                REFRESH_URL,
+                {"identifier": f"user-{i}"},
+                format="json",
+            )
+            last = response.status_code
+        assert last == status.HTTP_429_TOO_MANY_REQUESTS
+
+    def test_refresh_rotates_token(self, api_client, create_user):
+        """New refresh token should be different from old one (rotation)."""
+        user = create_user()
+        token = Token()
+        _, old_refresh = generate_auth_token(token_class=token, user_id=str(user.id))
+
+        response = api_client.post(REFRESH_URL, {"refresh_token": old_refresh})
+        assert response.status_code == status.HTTP_200_OK
+        assert response.data["refresh"] != old_refresh
+
+    def test_reused_refresh_rejects_successor(self, api_client, create_user):
+        user = create_user()
+        token = Token()
+        _, refresh = generate_auth_token(
+            token_class=token,
+            user_id=str(user.id),
+        )
+        rotated = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": refresh},
+            format="json",
+        )
+        assert rotated.status_code == status.HTTP_200_OK
+        successor = rotated.data["refresh"]
+        replay = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": refresh},
+            format="json",
+        )
+        assert replay.status_code == status.HTTP_403_FORBIDDEN
+        again = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": successor},
+            format="json",
+        )
+        assert again.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_revoked_family_outlives_old_token(self, api_client, create_user):
+        user = create_user()
+        token = Token()
+        short = token.generate_token(
+            user_id=str(user.id),
+            token_type="refresh",
+            token_lifetime=timedelta(seconds=5),
+            user_data={"family": "near-expiry"},
+        )
+        rotated = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": short},
+            format="json",
+        )
+        assert rotated.status_code == status.HTTP_200_OK
+        successor = rotated.data["refresh"]
+        replay = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": short},
+            format="json",
+        )
+        assert replay.status_code == status.HTTP_403_FORBIDDEN
+        clock = "django.core.cache.backends.locmem.time.time"
+        with patch(clock, return_value=time.time() + 120):
+            again = api_client.post(
+                REFRESH_URL,
+                {"refresh_token": successor},
+                format="json",
+            )
+        assert again.status_code == status.HTTP_403_FORBIDDEN
+
+    def test_logout_rejects_presented_tokens(self, api_client, create_user):
+        user = create_user()
+        token = Token()
+        access, refresh = generate_auth_token(
+            token_class=token,
+            user_id=str(user.id),
+        )
+        api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {access}")
+        logout = api_client.post(
+            "/token/logout/",
+            {"refresh_token": refresh},
+            format="json",
+        )
+        assert logout.status_code == status.HTTP_204_NO_CONTENT
+        denied = api_client.post(
+            reverse("change-password"),
+            {},
+            format="json",
+        )
+        assert denied.status_code == status.HTTP_401_UNAUTHORIZED
+        refreshed = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": refresh},
+            format="json",
+        )
+        assert refreshed.status_code == status.HTTP_403_FORBIDDEN
+
+    def _access_status(self, api_client, access):
+        api_client.credentials(
+            HTTP_AUTHORIZATION=f"Bearer {access}",
+        )
+        response = api_client.post(
+            reverse("change-password"),
+            {},
+            format="json",
+        )
+        return response.status_code
+
+    def test_reuse_rejects_family_access(self, api_client, create_user):
+        user = create_user()
+        token = Token()
+        access, refresh = generate_auth_token(
+            token_class=token,
+            user_id=str(user.id),
+        )
+        rotated = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": refresh},
+            format="json",
+        )
+        assert rotated.status_code == status.HTTP_200_OK
+        replay = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": refresh},
+            format="json",
+        )
+        assert replay.status_code == status.HTTP_403_FORBIDDEN
+        denied = status.HTTP_401_UNAUTHORIZED
+        assert self._access_status(api_client, access) == denied
+        rotated_access = rotated.data["access"]
+        assert self._access_status(api_client, rotated_access) == denied
+
+    def test_logout_rejects_prior_access(self, api_client, create_user):
+        user = create_user()
+        token = Token()
+        earlier, refresh = generate_auth_token(
+            token_class=token,
+            user_id=str(user.id),
+        )
+        rotated = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": refresh},
+            format="json",
+        )
+        assert rotated.status_code == status.HTTP_200_OK
+        current = rotated.data["access"]
+        api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {current}")
+        logout = api_client.post(
+            "/token/logout/",
+            {"refresh_token": rotated.data["refresh"]},
+            format="json",
+        )
+        assert logout.status_code == status.HTTP_204_NO_CONTENT
+        denied = status.HTTP_401_UNAUTHORIZED
+        assert self._access_status(api_client, earlier) == denied
+
+    def test_other_family_access_works(self, api_client, create_user):
+        user = create_user()
+        token = Token()
+        _, refresh = generate_auth_token(
+            token_class=token,
+            user_id=str(user.id),
+        )
+        rotated = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": refresh},
+            format="json",
+        )
+        assert rotated.status_code == status.HTTP_200_OK
+        replay = api_client.post(
+            REFRESH_URL,
+            {"refresh_token": refresh},
+            format="json",
+        )
+        assert replay.status_code == status.HTTP_403_FORBIDDEN
+        other, _ = generate_auth_token(
+            token_class=token,
+            user_id=str(user.id),
+        )
+        allowed = status.HTTP_400_BAD_REQUEST
+        assert self._access_status(api_client, other) == allowed
+        plain = token.generate_token(
+            user_id=str(user.id),
+            token_type="access",
+            token_lifetime=timedelta(minutes=5),
+        )
+        assert self._access_status(api_client, plain) == allowed

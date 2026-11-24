@@ -1,0 +1,362 @@
+"""Tests for the upstream port's hardening items not exercised elsewhere.
+
+Covers:
+
+* #3 — startup validation for ``WALLET_LOGIN_EXPECTED_DOMAINS`` in non-DEBUG.
+* #10 — throttle scoping per (IP, wallet_address, scope).
+* #11 — ``prune_wallet_nonces`` management command.
+"""
+
+from __future__ import annotations
+
+from datetime import timedelta
+from io import StringIO
+
+import pytest
+from django.apps import apps
+from django.core.cache import cache
+from django.core.exceptions import ImproperlyConfigured
+from django.core.management import call_command
+from django.utils import timezone
+
+from blockauth.apps import validate_wallet_login_settings
+from blockauth.conf import auth_settings
+from blockauth.models.wallet_login_nonce import WalletLoginNonce
+
+# =============================================================================
+# Hardening #3 — startup validation
+# =============================================================================
+
+
+class TestStartupValidation:
+    def test_debug_true_is_permissive(self, settings):
+        settings.DEBUG = True
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ()
+        # Must not raise.
+        validate_wallet_login_settings()
+
+    def test_empty_allowlist_in_production_raises(self, settings):
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ()
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = False
+        with pytest.raises(ImproperlyConfigured, match="non-empty"):
+            validate_wallet_login_settings()
+
+    def test_production_with_allowlist_is_accepted(self, settings):
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ("app.example.com",)
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = False
+        validate_wallet_login_settings()
+
+    def test_non_iterable_allowlist_raises(self, settings):
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = "app.example.com"  # str, not tuple
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = False
+        with pytest.raises(ImproperlyConfigured, match="list, tuple or set"):
+            validate_wallet_login_settings()
+
+    def test_blank_entry_rejected(self, settings):
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ("app.example.com", "")
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = False
+        with pytest.raises(ImproperlyConfigured, match="invalid entries"):
+            validate_wallet_login_settings()
+
+    def test_skip_flag_bypasses_check(self, settings):
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ()
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = True
+        validate_wallet_login_settings()
+
+    # ---- #93: offline management commands must not fire the check ----------
+    #
+    # ``ready()`` runs on every ``django.setup()`` including ``collectstatic``
+    # inside a Dockerfile, which would otherwise block every consumer build
+    # until they set ``WALLET_LOGIN_SKIP_STARTUP_VALIDATION`` in every RUN
+    # step. The guard whitelists offline commands so the check only fires
+    # for serving boots (``runserver``, gunicorn, uvicorn, ...).
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "collectstatic",
+            "migrate",
+            "makemigrations",
+            "check",
+            "test",
+            "shell",
+            "dbshell",
+            "showmigrations",
+            "compilemessages",
+            "loaddata",
+            "createsuperuser",
+            "flush",
+        ],
+    )
+    def test_offline_command_skips_check(self, settings, monkeypatch, command):
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ()
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = False
+        monkeypatch.setattr("sys.argv", ["manage.py", command])
+        # Must not raise.
+        validate_wallet_login_settings()
+
+    def test_runserver_still_validates(self, settings, monkeypatch):
+        """``runserver`` binds a port, so the check must fire."""
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ()
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = False
+        monkeypatch.setattr("sys.argv", ["manage.py", "runserver"])
+        with pytest.raises(ImproperlyConfigured, match="non-empty"):
+            validate_wallet_login_settings()
+
+    def test_wsgi_boot_still_validates(self, settings, monkeypatch):
+        """gunicorn/uvicorn never go through manage.py; argv[1] is not a
+        Django command so the guard falls through and the check fires.
+        """
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ()
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = False
+        monkeypatch.setattr("sys.argv", ["gunicorn", "myapp.wsgi:application"])
+        with pytest.raises(ImproperlyConfigured, match="non-empty"):
+            validate_wallet_login_settings()
+
+    def test_argv_with_no_command_still_validates(self, settings, monkeypatch):
+        """No subcommand -> treat as serving boot (fail closed)."""
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ()
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = False
+        monkeypatch.setattr("sys.argv", ["manage.py"])
+        with pytest.raises(ImproperlyConfigured, match="non-empty"):
+            validate_wallet_login_settings()
+
+    def test_offline_command_with_allowlist_still_accepted(self, settings, monkeypatch):
+        """Sanity: a valid allow-list shouldn't regress the offline path."""
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ("app.example.com",)
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = False
+        monkeypatch.setattr("sys.argv", ["manage.py", "migrate"])
+        validate_wallet_login_settings()
+
+    # ---- SIWE domains are only required when a SIWE-backed feature is on ----
+    #
+    # Only the WALLET_LOGIN and WALLET_LINK routes reach the SIWE service. A
+    # deployment with both disabled must boot without SIWE settings. The
+    # tests patch ``auth_settings.FEATURES`` so the real ``is_feature_enabled``
+    # path (the one that mounts routes) is exercised. They call
+    # ``validate_wallet_login_settings`` directly; that ``ready()`` invokes it
+    # is covered by ``test_ready_runs_wallet_settings_validation``. Patching
+    # ``FEATURES`` replaces the snapshot ``blockauth.conf`` takes of
+    # ``BLOCK_AUTH_SETTINGS["FEATURES"]``, so that settings read is not
+    # exercised here.
+
+    @staticmethod
+    def _serving_boot_without_domains(settings, monkeypatch, features):
+        settings.DEBUG = False
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ()
+        settings.WALLET_LOGIN_SKIP_STARTUP_VALIDATION = False
+        monkeypatch.setattr("sys.argv", ["gunicorn", "myapp.wsgi:application"])
+        monkeypatch.setattr(auth_settings, "FEATURES", features)
+
+    def test_wallet_features_disabled_skips_domain_check(self, settings, monkeypatch):
+        self._serving_boot_without_domains(settings, monkeypatch, {"WALLET_LOGIN": False, "WALLET_LINK": False})
+        # Must not raise.
+        validate_wallet_login_settings()
+
+    def test_wallet_login_enabled_still_requires_domains(self, settings, monkeypatch):
+        self._serving_boot_without_domains(settings, monkeypatch, {"WALLET_LOGIN": True, "WALLET_LINK": False})
+        with pytest.raises(ImproperlyConfigured, match="non-empty"):
+            validate_wallet_login_settings()
+
+    def test_wallet_link_enabled_still_requires_domains(self, settings, monkeypatch):
+        self._serving_boot_without_domains(settings, monkeypatch, {"WALLET_LOGIN": False, "WALLET_LINK": True})
+        with pytest.raises(ImproperlyConfigured, match="non-empty"):
+            validate_wallet_login_settings()
+
+    @pytest.mark.parametrize("enabled_feature", ["WALLET_LOGIN", "WALLET_LINK"])
+    @pytest.mark.parametrize(
+        "domains, message",
+        [
+            ("app.example.com", "list, tuple or set"),
+            (("app.example.com", ""), "invalid entries"),
+            (("app.example.com", "   "), "invalid entries"),
+        ],
+    )
+    def test_enabled_wallet_feature_rejects_malformed_domains(
+        self, settings, monkeypatch, enabled_feature, domains, message
+    ):
+        features = {"WALLET_LOGIN": False, "WALLET_LINK": False, enabled_feature: True}
+        self._serving_boot_without_domains(settings, monkeypatch, features)
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = domains
+        with pytest.raises(ImproperlyConfigured, match=message):
+            validate_wallet_login_settings()
+
+    @pytest.mark.parametrize("enabled_feature", ["WALLET_LOGIN", "WALLET_LINK"])
+    @pytest.mark.parametrize(
+        "domain",
+        ["https://x.com", "x.com/path", ":5173", "example.com:abc", "user@example.com"],
+    )
+    def test_enabled_wallet_feature_rejects_domains_the_service_would_drop(
+        self, settings, monkeypatch, enabled_feature, domain
+    ):
+        """An entry ``WalletLoginService`` discards must fail at boot, not on the first challenge."""
+        features = {"WALLET_LOGIN": False, "WALLET_LINK": False, enabled_feature: True}
+        self._serving_boot_without_domains(settings, monkeypatch, features)
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = ("app.example.com", domain)
+        with pytest.raises(ImproperlyConfigured, match="invalid entries"):
+            validate_wallet_login_settings()
+
+    @pytest.mark.parametrize("domain", ["app.example.com", "App.Example.com:8443", "localhost:5173", "[::1]:5173"])
+    def test_enabled_wallet_feature_accepts_valid_authorities(self, settings, monkeypatch, domain):
+        self._serving_boot_without_domains(settings, monkeypatch, {"WALLET_LOGIN": True, "WALLET_LINK": True})
+        settings.WALLET_LOGIN_EXPECTED_DOMAINS = (domain,)
+        # Must not raise.
+        validate_wallet_login_settings()
+
+    def test_skipped_check_logs_that_wallet_features_are_disabled(self, settings, monkeypatch, caplog):
+        self._serving_boot_without_domains(settings, monkeypatch, {"WALLET_LOGIN": False, "WALLET_LINK": False})
+        with caplog.at_level("DEBUG", logger="blockauth.apps"):
+            validate_wallet_login_settings()
+        assert "SIWE allow-list validation skipped" in caplog.text
+
+    def test_ready_runs_wallet_settings_validation(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr("blockauth.apps.validate_wallet_login_settings", lambda: calls.append(True))
+        apps.get_app_config("blockauth").ready()
+        assert calls == [True]
+
+    @pytest.mark.parametrize("features", [{}, {"SIGNUP": True}, {"WALLET_LOGIN": False}, {"WALLET_LINK": False}])
+    def test_unset_wallet_features_default_to_enabled(self, settings, monkeypatch, features):
+        """A missing key counts as enabled, exactly as it does when routes mount."""
+        self._serving_boot_without_domains(settings, monkeypatch, features)
+        with pytest.raises(ImproperlyConfigured, match="non-empty"):
+            validate_wallet_login_settings()
+
+    def test_wallet_email_add_alone_does_not_require_domains(self, settings, monkeypatch):
+        features = {"WALLET_LOGIN": False, "WALLET_LINK": False, "WALLET_EMAIL_ADD": True}
+        self._serving_boot_without_domains(settings, monkeypatch, features)
+        # Must not raise.
+        validate_wallet_login_settings()
+
+
+# =============================================================================
+# Hardening #10 — throttle scoping
+# =============================================================================
+
+
+class _FakeRequest:
+    """Minimal stand-in for a DRF request used by the throttle."""
+
+    def __init__(self, *, ip: str, address: str | None):
+        self.META = {"REMOTE_ADDR": ip}
+        self.data: dict = {}
+        if address is not None:
+            self.data["address"] = address
+
+
+class TestWalletThrottleScoping:
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        cache.clear()
+        yield
+        cache.clear()
+
+    def test_different_addresses_get_independent_buckets(self):
+        from blockauth.utils.rate_limiter import WalletChallengeThrottle
+
+        throttle = WalletChallengeThrottle(rate=(2, 60))
+        req_a = _FakeRequest(ip="198.51.100.7", address="0x" + "a" * 40)
+        req_b = _FakeRequest(ip="198.51.100.7", address="0x" + "b" * 40)
+
+        assert throttle.allow_request(req_a, None) is True
+        assert throttle.allow_request(req_a, None) is True
+        # Address-A bucket is now full — next request for A is denied.
+        assert throttle.allow_request(req_a, None) is False
+        # Address-B on the same IP is still allowed.
+        assert throttle.allow_request(req_b, None) is True
+
+    def test_challenge_and_login_scopes_are_independent(self):
+        from blockauth.utils.rate_limiter import (
+            WalletChallengeThrottle,
+            WalletLoginThrottle,
+        )
+
+        req = _FakeRequest(ip="198.51.100.7", address="0x" + "a" * 40)
+        challenge = WalletChallengeThrottle(rate=(1, 60))
+        login = WalletLoginThrottle(rate=(1, 60))
+
+        assert challenge.allow_request(req, None) is True
+        assert challenge.allow_request(req, None) is False
+        # Login endpoint has its own bucket.
+        assert login.allow_request(req, None) is True
+
+    def test_rejects_when_address_missing_but_ip_present(self):
+        """No address -> still gets a bucket keyed on IP + scope."""
+        from blockauth.utils.rate_limiter import WalletLoginThrottle
+
+        throttle = WalletLoginThrottle(rate=(1, 60))
+        req = _FakeRequest(ip="198.51.100.7", address=None)
+        assert throttle.allow_request(req, None) is True
+        assert throttle.allow_request(req, None) is False
+
+
+# =============================================================================
+# Hardening #11 — reaper management command
+# =============================================================================
+
+
+@pytest.mark.django_db
+class TestPruneWalletNonces:
+    def _create(self, *, nonce, expires_at, consumed_at=None):
+        now = timezone.now()
+        return WalletLoginNonce.objects.create(
+            address="0x" + "a" * 40,
+            nonce=nonce,
+            domain="example.com",
+            uri="https://example.com/",
+            chain_id=1,
+            issued_at=now,
+            expires_at=expires_at,
+            consumed_at=consumed_at,
+        )
+
+    def test_removes_expired_rows(self):
+        now = timezone.now()
+        self._create(nonce="expired_" + "a" * 24, expires_at=now - timedelta(seconds=1))
+        self._create(nonce="live_" + "b" * 28, expires_at=now + timedelta(minutes=5))
+
+        out = StringIO()
+        call_command("prune_wallet_nonces", stdout=out)
+        remaining = list(WalletLoginNonce.objects.values_list("nonce", flat=True))
+        assert len(remaining) == 1
+        assert remaining[0].startswith("live_")
+        assert "Deleted 1" in out.getvalue()
+
+    def test_removes_old_consumed_rows(self):
+        now = timezone.now()
+        # Still in TTL but consumed long ago — should be reaped.
+        self._create(
+            nonce="consumed_old_" + "a" * 16,
+            expires_at=now + timedelta(minutes=1),
+            consumed_at=now - timedelta(hours=2),
+        )
+        # Consumed recently — keep (caller may want to inspect it).
+        self._create(
+            nonce="consumed_new_" + "b" * 16,
+            expires_at=now + timedelta(minutes=1),
+            consumed_at=now - timedelta(minutes=1),
+        )
+
+        call_command("prune_wallet_nonces", "--older-than", "3600", stdout=StringIO())
+        remaining = list(WalletLoginNonce.objects.values_list("nonce", flat=True))
+        assert len(remaining) == 1
+        assert remaining[0].startswith("consumed_new_")
+
+    def test_dry_run_does_not_delete(self):
+        now = timezone.now()
+        self._create(nonce="expired_" + "a" * 24, expires_at=now - timedelta(seconds=1))
+
+        out = StringIO()
+        call_command("prune_wallet_nonces", "--dry-run", stdout=out)
+        assert WalletLoginNonce.objects.count() == 1
+        assert "dry-run" in out.getvalue()
